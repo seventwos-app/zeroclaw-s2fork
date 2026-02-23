@@ -1,0 +1,777 @@
+openapi: 3.1.0
+info:
+  title: ZeroClaw Gateway API
+  description: |
+    HTTP API for the ZeroClaw agent gateway. Provides webhook-based chat,
+    direct memory access, and multi-turn conversation threading.
+  version: 1.0.0
+  contact:
+    name: ZeroClaw
+    url: https://github.com/elev8tion/zeroclaw-chat
+
+servers:
+  - url: http://localhost:8080
+    description: Local gateway (default)
+  - url: https://gateway.ay8.app
+    description: Cloudflare Tunnel
+
+security:
+  - bearerAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Bearer token obtained via POST /pair or pre-configured in
+        `paired_tokens` in config.toml. Tokens are SHA-256 hashed
+        before comparison.
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        success:
+          type: boolean
+          const: false
+        error:
+          type: string
+      required: [success, error]
+      example:
+        success: false
+        error: "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+
+    SuccessEnvelope:
+      type: object
+      properties:
+        success:
+          type: boolean
+          const: true
+        data:
+          description: Response payload (varies by endpoint)
+      required: [success, data]
+
+    MemoryEntry:
+      type: object
+      properties:
+        id:
+          type: string
+        key:
+          type: string
+        content:
+          type: string
+        category:
+          type: string
+          enum: [core, daily, conversation]
+          description: Known categories. Custom strings are also accepted.
+        timestamp:
+          type: string
+          format: date-time
+        session_id:
+          type: string
+          nullable: true
+        score:
+          type: number
+          nullable: true
+          description: Relevance score (present in search results)
+      required: [id, key, content, category, timestamp]
+
+    StoreMemoryRequest:
+      type: object
+      properties:
+        key:
+          type: string
+          description: Unique key for the memory entry
+        content:
+          type: string
+          description: The memory content to store
+        category:
+          type: string
+          description: "Memory category: core, daily, conversation, or custom string"
+          default: core
+        session_id:
+          type: string
+          description: Optional session scope
+      required: [key, content]
+      example:
+        key: "user_preference_lang"
+        content: "User prefers Rust for systems programming"
+        category: "core"
+
+    WebhookRequest:
+      type: object
+      properties:
+        message:
+          type: string
+          description: The user message to process
+        conversation_id:
+          type: string
+          description: |
+            Optional conversation ID for multi-turn threading.
+            When present, prior messages are loaded as context and
+            the exchange is persisted. When absent, the request is
+            stateless (existing behavior).
+      required: [message]
+      example:
+        message: "What is the weather like?"
+        conversation_id: "conv-abc-123"
+
+    WebhookResponse:
+      type: object
+      properties:
+        response:
+          type: string
+          description: The agent's response text
+        model:
+          type: string
+          description: The LLM model used
+        conversation_id:
+          type: string
+          description: Echoed back when conversation_id was provided in the request
+        tool_calls:
+          type: array
+          items:
+            type: object
+            properties:
+              tool:
+                type: string
+              input:
+                type: string
+              output:
+                type: string
+          description: Tool calls executed during the agent loop
+      required: [response, model]
+
+    ConversationInfo:
+      type: object
+      properties:
+        id:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        message_count:
+          type: integer
+      required: [id, created_at, updated_at, message_count]
+
+    ConversationMessage:
+      type: object
+      properties:
+        id:
+          type: string
+        conversation_id:
+          type: string
+        role:
+          type: string
+          enum: [user, assistant, system, tool]
+        content:
+          type: string
+        tool_calls_json:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+      required: [id, conversation_id, role, content, created_at]
+
+    PairRequest:
+      type: object
+      description: No body required. Send X-Pairing-Code header.
+
+    PairResponse:
+      type: object
+      properties:
+        paired:
+          type: boolean
+        token:
+          type: string
+          description: Bearer token to use for subsequent requests
+        message:
+          type: string
+      required: [paired, token, message]
+
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        paired:
+          type: boolean
+        runtime:
+          type: object
+      required: [status, paired]
+
+    InfoResponse:
+      type: object
+      properties:
+        delegates:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              provider:
+                type: string
+              model:
+                type: string
+        tools:
+          type: array
+          items:
+            type: string
+        channels:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              status:
+                type: string
+        model:
+          type: string
+        provider:
+          type: string
+        mcp_servers:
+          type: array
+          items:
+            type: object
+      required: [delegates, tools, channels, model, provider]
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid Bearer token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            success: false
+            error: "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+
+    TooManyRequests:
+      description: Rate limit exceeded
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+              retry_after:
+                type: integer
+            example:
+              error: "Too many requests. Please retry later."
+              retry_after: 60
+
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+paths:
+  # ── Core ──────────────────────────────────────────────────────────────────
+
+  /health:
+    get:
+      tags: [Core]
+      summary: Health check
+      description: Always public. Returns gateway status and component health.
+      security: []
+      responses:
+        '200':
+          description: Gateway is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /info:
+    get:
+      tags: [Core]
+      summary: Runtime information
+      description: |
+        Returns available tools, delegate agents, channels, and MCP server status.
+        Protected by Bearer token when pairing is enabled.
+      responses:
+        '200':
+          description: Runtime info
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InfoResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /pair:
+    post:
+      tags: [Core]
+      summary: Exchange pairing code for bearer token
+      description: |
+        One-time pairing endpoint. Send the pairing code displayed at gateway
+        startup in the X-Pairing-Code header. Returns a bearer token for
+        subsequent authenticated requests.
+      security: []
+      parameters:
+        - name: X-Pairing-Code
+          in: header
+          required: true
+          schema:
+            type: string
+          description: One-time pairing code from gateway startup
+      responses:
+        '200':
+          description: Successfully paired
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PairResponse'
+        '403':
+          description: Invalid pairing code
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  # ── Webhook ───────────────────────────────────────────────────────────────
+
+  /webhook:
+    post:
+      tags: [Webhook]
+      summary: Send a message to the agent
+      description: |
+        Main chat endpoint. Runs the full agent loop with tool execution.
+
+        **Stateless mode** (default): omit `conversation_id`. Each request is
+        independent — no prior context is loaded.
+
+        **Multi-turn mode**: include `conversation_id`. The gateway loads prior
+        messages from the conversation store, runs the agent with full context,
+        and persists the exchange. The `conversation_id` is echoed in the response.
+
+        Supports optional headers:
+        - `X-Webhook-Secret`: additional auth layer (SHA-256 verified)
+        - `X-Idempotency-Key`: prevents duplicate processing
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookRequest'
+      parameters:
+        - name: X-Webhook-Secret
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Optional webhook secret for additional authentication
+        - name: X-Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Optional idempotency key to prevent duplicate processing
+      responses:
+        '200':
+          description: Agent response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookResponse'
+        '400':
+          description: Invalid request body
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ── Memory ────────────────────────────────────────────────────────────────
+
+  /memory:
+    post:
+      tags: [Memory]
+      summary: Store a memory
+      description: |
+        Store a key-value memory entry, optionally categorized and session-scoped.
+        Uses the existing memory backend (SQLite, Lucid, etc.).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StoreMemoryRequest'
+      responses:
+        '201':
+          description: Memory stored
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          key:
+                            type: string
+                          stored:
+                            type: boolean
+        '400':
+          description: Invalid request body
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    get:
+      tags: [Memory]
+      summary: List memories
+      description: |
+        List all memory entries, optionally filtered by category and/or session.
+      parameters:
+        - name: category
+          in: query
+          schema:
+            type: string
+          description: "Filter by category: core, daily, conversation, or custom"
+        - name: session_id
+          in: query
+          schema:
+            type: string
+          description: Filter by session ID
+      responses:
+        '200':
+          description: List of memory entries
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/MemoryEntry'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /memory/search:
+    get:
+      tags: [Memory]
+      summary: Search memories
+      description: |
+        Vector + keyword search across memories. Returns entries ranked by
+        relevance score.
+      parameters:
+        - name: query
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Search query string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 5
+            maximum: 100
+          description: Maximum number of results
+        - name: session_id
+          in: query
+          schema:
+            type: string
+          description: Scope search to a session
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/MemoryEntry'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /memory/key/{key}:
+    get:
+      tags: [Memory]
+      summary: Get memory by key
+      description: Retrieve a single memory entry by its unique key.
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The memory key
+      responses:
+        '200':
+          description: Memory entry
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/MemoryEntry'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Memory not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+    delete:
+      tags: [Memory]
+      summary: Delete memory by key
+      description: Remove a memory entry by its unique key.
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The memory key to delete
+      responses:
+        '200':
+          description: Memory deleted
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          key:
+                            type: string
+                          deleted:
+                            type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Memory not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /memory/count:
+    get:
+      tags: [Memory]
+      summary: Count memories
+      description: Returns the total number of memory entries.
+      responses:
+        '200':
+          description: Memory count
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          count:
+                            type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ── Conversations ─────────────────────────────────────────────────────────
+
+  /conversations:
+    get:
+      tags: [Conversations]
+      summary: List conversations
+      description: |
+        List all conversations, ordered by most recently updated.
+        Supports pagination via `limit` and `offset` query parameters.
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+            maximum: 200
+          description: Maximum conversations to return
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+          description: Number of conversations to skip
+      responses:
+        '200':
+          description: List of conversations
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/ConversationInfo'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: Conversation store not available
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /conversations/{id}:
+    get:
+      tags: [Conversations]
+      summary: Get conversation with history
+      description: |
+        Returns a conversation's metadata and full message history,
+        ordered from oldest to newest.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Conversation ID
+      responses:
+        '200':
+          description: Conversation with messages
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          conversation:
+                            $ref: '#/components/schemas/ConversationInfo'
+                          messages:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/ConversationMessage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Conversation not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Conversation store not available
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    delete:
+      tags: [Conversations]
+      summary: Delete conversation
+      description: |
+        Deletes a conversation and all its messages (cascade delete).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Conversation ID to delete
+      responses:
+        '200':
+          description: Conversation deleted
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          id:
+                            type: string
+                          deleted:
+                            type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Conversation not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Conversation store not available
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+tags:
+  - name: Core
+    description: Health check, runtime info, and pairing
+  - name: Webhook
+    description: Main chat endpoint with agent loop execution
+  - name: Memory
+    description: Direct memory access (read/write/search/delete)
+  - name: Conversations
+    description: Multi-turn conversation management

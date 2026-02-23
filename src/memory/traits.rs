@@ -38,6 +38,16 @@ impl std::fmt::Display for MemoryCategory {
     }
 }
 
+/// Parse a string into a `MemoryCategory`, falling back to `Custom` for unknown values.
+pub fn parse_category(s: &str) -> MemoryCategory {
+    match s {
+        "core" => MemoryCategory::Core,
+        "daily" => MemoryCategory::Daily,
+        "conversation" => MemoryCategory::Conversation,
+        other => MemoryCategory::Custom(other.into()),
+    }
+}
+
 /// Core memory trait — implement for any persistence backend
 #[async_trait]
 pub trait Memory: Send + Sync {
@@ -93,6 +103,17 @@ mod tests {
         assert_eq!(
             MemoryCategory::Custom("project_notes".into()).to_string(),
             "project_notes"
+        );
+    }
+
+    #[test]
+    fn parse_category_known_and_custom() {
+        assert_eq!(parse_category("core"), MemoryCategory::Core);
+        assert_eq!(parse_category("daily"), MemoryCategory::Daily);
+        assert_eq!(parse_category("conversation"), MemoryCategory::Conversation);
+        assert_eq!(
+            parse_category("project_notes"),
+            MemoryCategory::Custom("project_notes".into())
         );
     }
 

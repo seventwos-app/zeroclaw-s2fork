@@ -7,6 +7,11 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+pub mod auth;
+pub mod conversations;
+pub mod memory_api;
+pub mod responses;
+
 use crate::agent::loop_::{agent_turn, build_tool_instructions, ToolCallRecord};
 use crate::channels::{Channel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
@@ -22,11 +27,12 @@ use anyhow::Result;
 use axum::{
     body::Bytes,
     extract::{Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
+use conversations::ConversationStore;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -203,6 +209,8 @@ pub struct AppState {
     pub config: Arc<Config>,
     /// MCP manager for graceful shutdown
     pub mcp_manager: Option<Arc<crate::mcp::McpManager>>,
+    /// Persistent conversation store for multi-turn threading
+    pub conversation_store: Option<Arc<ConversationStore>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -422,6 +430,21 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     crate::health::mark_component_ok("gateway");
 
+    // Conversation store for multi-turn threading
+    let conversation_store = match ConversationStore::new(
+        &config.workspace_dir,
+        config.agent.max_history_messages,
+    ) {
+        Ok(store) => {
+            tracing::info!("💬 Conversation store enabled (max history: {})", config.agent.max_history_messages);
+            Some(Arc::new(store))
+        }
+        Err(e) => {
+            tracing::warn!("Conversation store disabled: {e}");
+            None
+        }
+    };
+
     // Build shared state
     let state = AppState {
         provider,
@@ -441,6 +464,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         system_prompt,
         config,
         mcp_manager,
+        conversation_store,
     };
 
     // Grab MCP ref for graceful shutdown before state is moved
@@ -454,6 +478,17 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
+        // Memory REST API
+        .route("/memory", post(memory_api::handle_store))
+        .route("/memory", get(memory_api::handle_list))
+        .route("/memory/search", get(memory_api::handle_search))
+        .route("/memory/key/{key}", get(memory_api::handle_get))
+        .route("/memory/key/{key}", delete(memory_api::handle_delete))
+        .route("/memory/count", get(memory_api::handle_count))
+        // Conversation management
+        .route("/conversations", get(conversations::handle_list))
+        .route("/conversations/{id}", get(conversations::handle_get))
+        .route("/conversations/{id}", delete(conversations::handle_delete))
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
@@ -492,17 +527,8 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 
 /// GET /info — runtime capabilities (protected by pairing)
 async fn handle_info(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    // ── Bearer token auth (pairing) ──
-    if state.pairing.require_pairing() {
-        let auth = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let token = auth.strip_prefix("Bearer ").unwrap_or("");
-        if !state.pairing.is_authenticated(token) {
-            let err = serde_json::json!({"error": "Unauthorized"});
-            return (StatusCode::UNAUTHORIZED, Json(err));
-        }
+    if let Err(resp) = auth::require_auth(&state.pairing, &headers) {
+        return resp;
     }
 
     let tool_names: Vec<&str> = state.tools_registry.iter().map(|t| t.name()).collect();
@@ -590,6 +616,9 @@ async fn handle_pair(State(state): State<AppState>, headers: HeaderMap) -> impl 
 #[derive(serde::Deserialize)]
 pub struct WebhookBody {
     pub message: String,
+    /// Optional conversation ID for multi-turn threading.
+    /// When present, the gateway loads prior messages and persists the exchange.
+    pub conversation_id: Option<String>,
 }
 
 /// POST /webhook — main webhook endpoint
@@ -609,19 +638,9 @@ async fn handle_webhook(
     }
 
     // ── Bearer token auth (pairing) ──
-    if state.pairing.require_pairing() {
-        let auth = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let token = auth.strip_prefix("Bearer ").unwrap_or("");
-        if !state.pairing.is_authenticated(token) {
-            tracing::warn!("Webhook: rejected — not paired / invalid bearer token");
-            let err = serde_json::json!({
-                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
-            });
-            return (StatusCode::UNAUTHORIZED, Json(err));
-        }
+    if let Err(resp) = auth::require_auth(&state.pairing, &headers) {
+        tracing::warn!("Webhook: rejected — not paired / invalid bearer token");
+        return resp;
     }
 
     // ── Webhook secret auth (optional, additional layer) ──
@@ -673,6 +692,7 @@ async fn handle_webhook(
     }
 
     let message = &webhook_body.message;
+    let conversation_id = webhook_body.conversation_id.as_deref();
 
     if state.auto_save {
         let key = webhook_memory_key();
@@ -701,6 +721,21 @@ async fn handle_webhook(
         }
     }
 
+    // ── Conversation threading: load prior messages if conversation_id is present ──
+    if let (Some(conv_id), Some(ref store)) = (conversation_id, &state.conversation_store) {
+        if let Err(e) = store.get_or_create(conv_id) {
+            tracing::warn!("Failed to get/create conversation {conv_id}: {e}");
+        }
+        if let Ok(prior) = store.get_recent_messages(conv_id, store.max_messages()) {
+            for msg in prior {
+                history.push(ChatMessage {
+                    role: msg.role,
+                    content: msg.content,
+                });
+            }
+        }
+    }
+
     history.push(ChatMessage::user(message.to_string()));
 
     // Run full agent loop with tools
@@ -719,11 +754,29 @@ async fn handle_webhook(
     .await
     {
         Ok(response) => {
-            let body = serde_json::json!({
+            // ── Persist conversation messages if conversation_id is present ──
+            if let (Some(conv_id), Some(ref store)) = (conversation_id, &state.conversation_store) {
+                if let Err(e) = store.append_message(conv_id, "user", message, None) {
+                    tracing::warn!("Failed to persist user message for conversation {conv_id}: {e}");
+                }
+                let tool_calls_json = if tool_records.is_empty() {
+                    None
+                } else {
+                    serde_json::to_string(&tool_records).ok()
+                };
+                if let Err(e) = store.append_message(conv_id, "assistant", &response, tool_calls_json.as_deref()) {
+                    tracing::warn!("Failed to persist assistant message for conversation {conv_id}: {e}");
+                }
+            }
+
+            let mut body = serde_json::json!({
                 "response": response,
                 "model": state.model,
                 "tool_calls": tool_records,
             });
+            if let Some(conv_id) = conversation_id {
+                body["conversation_id"] = serde_json::Value::String(conv_id.to_string());
+            }
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
@@ -929,7 +982,14 @@ mod tests {
         let valid = r#"{"message": "hello"}"#;
         let parsed: Result<WebhookBody, _> = serde_json::from_str(valid);
         assert!(parsed.is_ok());
-        assert_eq!(parsed.unwrap().message, "hello");
+        let body = parsed.unwrap();
+        assert_eq!(body.message, "hello");
+        assert!(body.conversation_id.is_none());
+
+        let with_conv = r#"{"message": "hello", "conversation_id": "conv-1"}"#;
+        let parsed: Result<WebhookBody, _> = serde_json::from_str(with_conv);
+        assert!(parsed.is_ok());
+        assert_eq!(parsed.unwrap().conversation_id.as_deref(), Some("conv-1"));
 
         let missing = r#"{"other": "field"}"#;
         let parsed: Result<WebhookBody, _> = serde_json::from_str(missing);
@@ -1184,6 +1244,7 @@ mod tests {
             system_prompt: Arc::from("You are a helpful assistant."),
             config: Arc::new(Config::default()),
             mcp_manager: None,
+            conversation_store: None,
         }
     }
 
@@ -1200,6 +1261,7 @@ mod tests {
 
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
+            conversation_id: None,
         }));
         let first = handle_webhook(State(state.clone()), headers.clone(), body)
             .await
@@ -1208,6 +1270,7 @@ mod tests {
 
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
+            conversation_id: None,
         }));
         let second = handle_webhook(State(state), headers, body)
             .await
@@ -1236,6 +1299,7 @@ mod tests {
 
         let body1 = Ok(Json(WebhookBody {
             message: "hello one".into(),
+            conversation_id: None,
         }));
         let first = handle_webhook(State(state.clone()), headers.clone(), body1)
             .await
@@ -1244,6 +1308,7 @@ mod tests {
 
         let body2 = Ok(Json(WebhookBody {
             message: "hello two".into(),
+            conversation_id: None,
         }));
         let second = handle_webhook(State(state), headers, body2)
             .await
@@ -1283,6 +1348,7 @@ mod tests {
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                conversation_id: None,
             })),
         )
         .await
@@ -1309,6 +1375,7 @@ mod tests {
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                conversation_id: None,
             })),
         )
         .await
@@ -1335,6 +1402,7 @@ mod tests {
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                conversation_id: None,
             })),
         )
         .await

@@ -38,13 +38,17 @@ Everything is committed, deployed, and working end-to-end.
 The gateway webhook runs the full agent loop with tools instead of raw LLM chat. Native Anthropic tool calling is working end-to-end — MCP tools execute via structured API tool use (not XML fallback). Key files:
 
 - `src/agent/loop_.rs` — `ToolCallRecord` struct, `agent_turn()` and `run_tool_call_loop()` accept optional tool record collection, MCP tools wired into both `run()` and `process_message()`
-- `src/gateway/mod.rs` — `agent_turn()` replaces `simple_chat()` in webhook handler, `GET /info` endpoint, `AppState` includes `mcp_manager`, 120s timeout
+- `src/gateway/mod.rs` — `agent_turn()` replaces `simple_chat()` in webhook handler, `GET /info` endpoint, `AppState` includes `mcp_manager` + `conversation_store`, 120s timeout, `conversation_id` in `WebhookBody` for multi-turn
+- `src/gateway/auth.rs` — reusable `require_auth()` Bearer token helper (extracted from duplicated patterns)
+- `src/gateway/responses.rs` — consistent JSON envelope helpers (`ok()`, `created()`, `err()`, `not_found()`)
+- `src/gateway/memory_api.rs` — 6 REST handlers for direct memory access (store, list, search, get, delete, count)
+- `src/gateway/conversations.rs` — `ConversationStore` (SQLite `conversations.db`) + 3 management handlers
 - `src/channels/mod.rs` — passes `None` for new tool_records param
 - `src/providers/anthropic.rs` — `chat_with_tools()` override: converts OpenAI-format tool JSON to Anthropic `NativeToolSpec`, sends via `/v1/messages` with native tool definitions
 - `src/providers/reliable.rs` — `supports_native_tools()` and `chat_with_tools()` delegation to inner provider
 - `src/mcp/` — **MCP client integration** (see below)
 
-1745 tests pass. Pre-existing flaky `memory::lucid` test (timing-dependent, unrelated).
+1767 tests pass. Pre-existing flaky `memory::lucid` test (timing-dependent, unrelated).
 
 ### MCP Client Integration
 
@@ -85,6 +89,32 @@ Features deployed:
 - **Manual TTS** — speaker button on agent messages for on-demand read-aloud
 
 Routes: `/api/chat`, `/api/health`, `/api/info`, `/api/messages`, `/api/pair`, `/api/transcribe`.
+
+### Gateway API Extensions
+
+New endpoints for custom app integration. All require Bearer token auth (same as webhook). Full spec: `openapi.yaml`.
+
+**Memory REST API** (`/memory`):
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/memory` | Store a memory (key, content, category, session_id) |
+| `GET` | `/memory` | List memories (optional `?category=core`) |
+| `GET` | `/memory/search` | Vector+keyword search (`?query=...&limit=5`) |
+| `GET` | `/memory/key/{key}` | Get memory by key |
+| `DELETE` | `/memory/key/{key}` | Forget memory by key |
+| `GET` | `/memory/count` | Count total memories |
+
+**Conversation Threading** (`/conversations` + webhook `conversation_id`):
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/webhook` | Now accepts optional `conversation_id` for multi-turn |
+| `GET` | `/conversations` | List conversations (`?limit=50&offset=0`) |
+| `GET` | `/conversations/{id}` | Get conversation + full message history |
+| `DELETE` | `/conversations/{id}` | Delete conversation and cascade messages |
+
+Conversations are stored in `conversations.db` (SQLite, WAL mode) alongside `brain.db`. The webhook loads prior messages when `conversation_id` is present, runs the agent with full context, then persists both user and assistant messages. Stateless mode (no `conversation_id`) is unchanged.
+
+Response envelope for new endpoints: `{"success": true, "data": ...}` or `{"success": false, "error": "..."}`.
 
 Voice flow: tap mic → record → tap again → Workers AI Whisper transcribes → auto-send to agent → agent responds → TTS reads response aloud. No manual send step for voice. Based on the `aismb` repo's VoiceOperator pattern (`getUserMedia` + `MediaRecorder` + server-side transcription).
 
