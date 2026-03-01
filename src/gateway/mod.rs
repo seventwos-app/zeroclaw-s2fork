@@ -11,6 +11,7 @@ pub mod auth;
 pub mod conversations;
 pub mod memory_api;
 pub mod responses;
+pub mod workflows;
 
 use crate::agent::loop_::{agent_turn, build_tool_instructions, ToolCallRecord};
 use crate::channels::{Channel, SendMessage, WhatsAppChannel};
@@ -42,10 +43,10 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
 
-/// Maximum request body size (64KB) — prevents memory exhaustion
-pub const MAX_BODY_SIZE: usize = 65_536;
-/// Request timeout (120s) — agent tool execution needs time
-pub const REQUEST_TIMEOUT_SECS: u64 = 120;
+/// Maximum request body size (10MB)
+pub const MAX_BODY_SIZE: usize = 10_485_760;
+/// Request timeout (600s) — 10 minutes for long agent tasks
+pub const REQUEST_TIMEOUT_SECS: u64 = 600;
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
@@ -489,6 +490,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/conversations", get(conversations::handle_list))
         .route("/conversations/{id}", get(conversations::handle_get))
         .route("/conversations/{id}", delete(conversations::handle_delete))
+        // Workflow discovery and execution
+        .route("/workflows", get(workflows::handle_list))
+        .route("/workflows/{category}/{id}/run", post(workflows::handle_run))
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
@@ -707,7 +711,7 @@ async fn handle_webhook(
 
     // Inject memory context if auto_save is enabled
     if state.auto_save {
-        if let Ok(entries) = state.mem.recall(message, 5, None).await {
+        if let Ok(entries) = state.mem.recall(message, 20, None).await {
             if !entries.is_empty() {
                 let context: Vec<String> = entries
                     .iter()
