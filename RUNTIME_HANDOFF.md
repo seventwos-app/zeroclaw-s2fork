@@ -307,8 +307,10 @@ interface Conversation {
 
 - **Agent in conversations**: `user_email` field — `"zeroclaw"` for individual, `"group:zeroclaw,researcher,coder"` for group
 - **Agent attribution in messages**: `model` field — `"claude-sonnet-4|researcher"` format, parsed by `parseModelField()`
-- **Mutable metadata**: NCB public RLS = read + create only (no updates/deletes). Pin, rename, archive, folder, tags stored in localStorage overlay (`zeroclaw_conv_meta`)
-- **Agent deletes**: localStorage deleted set (`zeroclaw_deleted_agents`), agent updates cached in `zeroclaw_agents_cache`
+- **Mutable metadata**: Pin, rename, archive write through to NCB via `PUT /update/conversations/{id}`. Folder and tags still stored in localStorage overlay (`zeroclaw_conv_meta`) — not NCB fields.
+- **Permanent delete**: `DELETE /delete/conversations/{id}` cascades to delete all messages for that conversation. `DELETE /delete/agents/{id}` removes the agent row.
+- **Agent deletes**: localStorage deleted set (`zeroclaw_deleted_agents`) used as optimistic filter; NCB delete fires in background
+- **Agent cache**: `zeroclaw_agents_cache` localStorage key
 - **Folders**: Stored in `zeroclaw_folders` localStorage key
 
 ---
@@ -319,7 +321,7 @@ Data API: `https://app.nocodebackend.com/api/data`
 Instance: `36905_zeroclaw_chat`
 Path format: `/create/<table>`, `/read/<table>`, `/search/<table>` with `?Instance=36905_zeroclaw_chat`
 
-RLS policies set to `public_readwrite` — no session cookies needed. Public RLS only supports read + create (no updates, no deletes).
+RLS policies set to `public_readwrite` — no session cookies needed. All CRUD operations (read, create, update, delete) are permitted.
 
 | Table | Fields | RLS |
 |-------|--------|-----|
@@ -510,7 +512,9 @@ All UI changes MUST follow these rules for iOS notch/status bar compatibility:
 
 - `GATEWAY_TOKEN` is server-only. Never use `NEXT_PUBLIC_` prefix for tokens.
 - NCB failures never block chat. Writes are awaited but wrapped in try/catch.
-- **Must await NCB writes** — Cloudflare Workers kill async work after response is sent. Fire-and-forget (`promise.then().catch()`) does NOT work.
+- **Must await NCB writes** — Cloudflare Workers kill async work after response is sent. Fire-and-forget (`promise.then().catch()`) does NOT work in server routes. Client-side hooks may fire-and-forget (`.catch(() => {})`).
+- **NCB delete endpoint**: `DELETE https://app.nocodebackend.com/api/data/delete/{table}/{id}?Instance=36905_zeroclaw_chat`
+- **NCB update endpoint**: `PUT https://app.nocodebackend.com/api/data/update/{table}/{id}?Instance=36905_zeroclaw_chat`
 - **Build**: `npx opennextjs-cloudflare build`. **Deploy**: `npx wrangler deploy`. Do NOT use `npx opennextjs-cloudflare deploy` (broken socket).
 - Do not add `export const runtime = 'edge'` to routes — OpenNext handles the runtime.
 - Structured JSON responses, not SSE streaming. Tool calls return after the agent loop completes.
@@ -540,6 +544,7 @@ All UI changes MUST follow these rules for iOS notch/status bar compatibility:
 
 | Commit | Description |
 |--------|-------------|
+| `d947959` | NCB RLS set to public_readwrite; real cascade delete (conversations+messages), agent delete, updateConversationAfterMessage persists to NCB |
 | `10f33e2` | Image resize before upload (≤1568px JPEG); MCP server toggle UI in sidebar |
 | `fbce96f` | Image and file attachment support in MessageInput (attach button, paste, drag-drop) |
 | `2211a06` | Chat UX: startup state restore, visible delete button, synthetic ZeroClaw primary agent |
