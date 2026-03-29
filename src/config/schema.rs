@@ -93,6 +93,10 @@ pub struct Config {
     #[serde(default)]
     pub hardware: HardwareConfig,
 
+    /// Android device control configuration.
+    #[serde(default)]
+    pub android: AndroidConfig,
+
     /// MCP (Model Context Protocol) client configuration.
     #[serde(default)]
     pub mcp: crate::mcp::config::McpConfig,
@@ -709,6 +713,67 @@ fn default_http_max_response_size() -> usize {
 
 fn default_http_timeout_secs() -> u64 {
     30
+}
+
+// ── Android ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AndroidConfig {
+    /// Enable `android_control` tool for device automation
+    #[serde(default)]
+    pub enabled: bool,
+    /// Device IP address (WiFi LAN or Tailscale 100.x.y.z)
+    #[serde(default = "default_android_host")]
+    pub host: String,
+    /// ADB TCP port (default: 5555)
+    #[serde(default = "default_android_port")]
+    pub port: u16,
+    /// Connection mode: "direct" | "ssh" | "tailscale"
+    #[serde(default = "default_android_connection")]
+    pub connection: String,
+    /// SSH jump host (for ssh connection mode)
+    #[serde(default)]
+    pub ssh_host: Option<String>,
+    /// SSH user (for ssh connection mode)
+    #[serde(default)]
+    pub ssh_user: Option<String>,
+    /// Path to SSH private key (for ssh connection mode)
+    #[serde(default)]
+    pub ssh_key_path: Option<String>,
+    /// SSH port (default: 22)
+    #[serde(default = "default_ssh_port")]
+    pub ssh_port: u16,
+}
+
+impl Default for AndroidConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: default_android_host(),
+            port: default_android_port(),
+            connection: default_android_connection(),
+            ssh_host: None,
+            ssh_user: None,
+            ssh_key_path: None,
+            ssh_port: default_ssh_port(),
+        }
+    }
+}
+
+fn default_android_host() -> String {
+    "192.168.1.42".to_string()
+}
+
+fn default_android_port() -> u16 {
+    5555
+}
+
+fn default_android_connection() -> String {
+    "direct".to_string()
+}
+
+fn default_ssh_port() -> u16 {
+    22
 }
 
 // ── Memory ───────────────────────────────────────────────────
@@ -1706,6 +1771,7 @@ impl Default for Config {
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            android: AndroidConfig::default(),
             mcp: crate::mcp::config::McpConfig::default(),
         }
     }
@@ -2239,6 +2305,7 @@ default_temperature = 0.7
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            android: AndroidConfig::default(),
             mcp: crate::mcp::config::McpConfig::default(),
         };
 
@@ -2349,6 +2416,7 @@ tool_dispatcher = "xml"
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            android: AndroidConfig::default(),
             mcp: crate::mcp::config::McpConfig::default(),
         };
 

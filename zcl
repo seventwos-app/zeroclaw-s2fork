@@ -1,0 +1,318 @@
+#!/usr/bin/env bash
+# zcl — ZeroClaw Control Script
+# Usage: zcl start | stop | restart | status | logs | build
+set -euo pipefail
+
+ZCL_DIR="$HOME/zeroclaw-main"
+ZCL_BIN="$ZCL_DIR/target/release/zeroclaw"
+TUNNEL_NAME="zeroclaw-gateway"
+PORT=8080
+PID_DIR="$HOME/.zeroclaw/run"
+GW_PID="$PID_DIR/gateway.pid"
+TN_PID="$PID_DIR/tunnel.pid"
+GW_LOG="/tmp/zeroclaw-gateway.log"
+TN_LOG="/tmp/zeroclaw-tunnel.log"
+GW_LAUNCHD="com.zeroclaw.gateway"
+TN_LAUNCHD="com.zeroclaw.tunnel"
+
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+mkdir -p "$PID_DIR"
+
+# ── Helpers ──────────────────────────────────────────────────
+
+_extract_token() {
+  local creds token
+  creds=$(security find-generic-password -s "Claude Code-credentials" -a "$(whoami)" -w 2>/dev/null) || {
+    echo -e "${RED}Error: Could not read Claude Code credentials from Keychain.${NC}" >&2
+    return 1
+  }
+  token=$(echo "$creds" | python3 -c "import sys,json; print(json.load(sys.stdin)['claudeAiOauth']['accessToken'])" 2>/dev/null) || {
+    echo -e "${RED}Error: Could not extract OAuth token.${NC}" >&2
+    return 1
+  }
+  [[ -z "$token" ]] && { echo -e "${RED}Error: OAuth token is empty.${NC}" >&2; return 1; }
+  echo "$token"
+}
+
+_launchd_running() {
+  local label="$1"
+  launchctl list "$label" &>/dev/null
+}
+
+_launchd_pid() {
+  local label="$1"
+  launchctl list "$label" 2>/dev/null | grep '"PID"' | awk -F'= ' '{print $2}' | tr -d ';'
+}
+
+_is_running() {
+  local pidfile="$1" launchd_label="${2:-}"
+  # Check launchd first
+  if [[ -n "$launchd_label" ]] && _launchd_running "$launchd_label"; then
+    return 0
+  fi
+  # Fall back to PID file
+  [[ -f "$pidfile" ]] && kill -0 "$(cat "$pidfile")" 2>/dev/null
+}
+
+_pid_of() {
+  local pidfile="$1" launchd_label="${2:-}"
+  # Try launchd PID first
+  if [[ -n "$launchd_label" ]]; then
+    local lpid
+    lpid=$(_launchd_pid "$launchd_label" 2>/dev/null)
+    if [[ -n "$lpid" && "$lpid" != "-" && "$lpid" != "0" ]]; then
+      echo "$lpid"
+      return
+    fi
+  fi
+  [[ -f "$pidfile" ]] && cat "$pidfile" 2>/dev/null || echo "-"
+}
+
+_stop_process() {
+  local name="$1" pidfile="$2"
+  if _is_running "$pidfile"; then
+    local pid
+    pid=$(cat "$pidfile")
+    kill "$pid" 2>/dev/null
+    # Wait up to 5s for clean shutdown
+    for _ in $(seq 1 10); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.5
+    done
+    # Force kill if still alive
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+    rm -f "$pidfile"
+    echo -e "  ${YELLOW}■${NC} $name stopped"
+  else
+    rm -f "$pidfile"
+    echo -e "  ${YELLOW}■${NC} $name was not running"
+  fi
+}
+
+# ── Commands ─────────────────────────────────────────────────
+
+cmd_start() {
+  echo -e "${BOLD}${CYAN}ZeroClaw Gateway Control${NC}"
+  echo ""
+
+  # 1. Start gateway (prefer launchd)
+  if _is_running "$GW_PID" "$GW_LAUNCHD"; then
+    echo -e "  ${GREEN}●${NC} Gateway already running (PID $(_pid_of "$GW_PID" "$GW_LAUNCHD"))"
+  else
+    echo -ne "  Starting gateway..."
+    if launchctl list "$GW_LAUNCHD" &>/dev/null 2>&1; then
+      # launchd agent is loaded but process died — kickstart it
+      launchctl kickstart "gui/$(id -u)/$GW_LAUNCHD" 2>/dev/null || true
+    else
+      # Load the launchd agent
+      launchctl load ~/Library/LaunchAgents/${GW_LAUNCHD}.plist 2>/dev/null || {
+        # Fallback: manual start
+        local token
+        token=$(_extract_token) || exit 1
+        ANTHROPIC_OAUTH_TOKEN="$token" nohup "$ZCL_BIN" daemon --port "$PORT" > "$GW_LOG" 2>&1 &
+        echo $! > "$GW_PID"
+      }
+    fi
+    sleep 2
+    if _is_running "$GW_PID" "$GW_LAUNCHD"; then
+      echo -e "\r  ${GREEN}●${NC} Gateway started (PID $(_pid_of "$GW_PID" "$GW_LAUNCHD"), port $PORT)"
+    else
+      echo -e "\r  ${RED}●${NC} Gateway failed to start — check $GW_LOG"
+    fi
+  fi
+
+  # 2. Start tunnel (prefer launchd)
+  if _is_running "$TN_PID" "$TN_LAUNCHD"; then
+    echo -e "  ${GREEN}●${NC} Tunnel already running (PID $(_pid_of "$TN_PID" "$TN_LAUNCHD"))"
+  else
+    echo -ne "  Starting tunnel..."
+    if launchctl list "$TN_LAUNCHD" &>/dev/null 2>&1; then
+      launchctl kickstart "gui/$(id -u)/$TN_LAUNCHD" 2>/dev/null || true
+    else
+      launchctl load ~/Library/LaunchAgents/${TN_LAUNCHD}.plist 2>/dev/null || {
+        nohup cloudflared tunnel run "$TUNNEL_NAME" > "$TN_LOG" 2>&1 &
+        echo $! > "$TN_PID"
+      }
+    fi
+    sleep 3
+    if _is_running "$TN_PID" "$TN_LAUNCHD"; then
+      echo -e "\r  ${GREEN}●${NC} Tunnel started (PID $(_pid_of "$TN_PID" "$TN_LAUNCHD"))"
+    else
+      echo -e "\r  ${RED}●${NC} Tunnel failed to start — check $TN_LOG"
+    fi
+  fi
+
+  # 3. Health check
+  echo ""
+  local health
+  health=$(curl -s -m 3 -H "Authorization: Bearer zc_local_dev_2026" "http://localhost:$PORT/health" 2>/dev/null) || health=""
+  if echo "$health" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['status']=='ok'" 2>/dev/null; then
+    echo -e "  ${GREEN}✓${NC} Local health check passed"
+  else
+    echo -e "  ${YELLOW}!${NC} Local health check failed (gateway may still be starting)"
+  fi
+
+  local remote
+  remote=$(curl -s -m 5 "https://gateway.ay8.app/health" 2>/dev/null) || remote=""
+  if echo "$remote" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['status']=='ok'" 2>/dev/null; then
+    echo -e "  ${GREEN}✓${NC} Remote tunnel check passed (gateway.ay8.app)"
+  else
+    echo -e "  ${YELLOW}!${NC} Remote tunnel not yet reachable (may take a few seconds)"
+  fi
+
+  echo ""
+}
+
+cmd_stop() {
+  echo -e "${BOLD}${CYAN}Stopping ZeroClaw...${NC}"
+  echo ""
+  # Unload launchd agents (stops + prevents auto-restart)
+  launchctl unload ~/Library/LaunchAgents/${TN_LAUNCHD}.plist 2>/dev/null && \
+    echo -e "  ${YELLOW}■${NC} Tunnel stopped (launchd)" || \
+    _stop_process "Tunnel" "$TN_PID"
+  launchctl unload ~/Library/LaunchAgents/${GW_LAUNCHD}.plist 2>/dev/null && \
+    echo -e "  ${YELLOW}■${NC} Gateway stopped (launchd)" || \
+    _stop_process "Gateway" "$GW_PID"
+  # Clean up any stray processes
+  pkill -f "zeroclaw.*daemon" 2>/dev/null || true
+  pkill -f "cloudflared.*$TUNNEL_NAME" 2>/dev/null || true
+  echo ""
+  echo -e "  ${CYAN}i${NC} Run ${BOLD}zcl start${NC} to re-enable auto-restart"
+  echo ""
+}
+
+cmd_restart() {
+  cmd_stop
+  sleep 1
+  cmd_start
+}
+
+cmd_status() {
+  echo -e "${BOLD}${CYAN}ZeroClaw Status${NC}"
+  echo ""
+
+  # Gateway
+  if _is_running "$GW_PID" "$GW_LAUNCHD"; then
+    local gw_mode="manual"
+    _launchd_running "$GW_LAUNCHD" && gw_mode="launchd"
+    echo -e "  ${GREEN}●${NC} Gateway    running  (PID $(_pid_of "$GW_PID" "$GW_LAUNCHD"), port $PORT, $gw_mode)"
+  else
+    echo -e "  ${RED}●${NC} Gateway    stopped"
+  fi
+
+  # Tunnel
+  if _is_running "$TN_PID" "$TN_LAUNCHD"; then
+    local tn_mode="manual"
+    _launchd_running "$TN_LAUNCHD" && tn_mode="launchd"
+    echo -e "  ${GREEN}●${NC} Tunnel     running  (PID $(_pid_of "$TN_PID" "$TN_LAUNCHD"), $tn_mode)"
+  else
+    echo -e "  ${RED}●${NC} Tunnel     stopped"
+  fi
+
+  # Android
+  local android_enabled
+  android_enabled=$(python3 -c "
+import tomllib, pathlib
+cfg = tomllib.loads(pathlib.Path('$HOME/.zeroclaw/config.toml').read_text())
+a = cfg.get('android', {})
+if a.get('enabled'):
+    print(f\"enabled  ({a.get('host','?')}:{a.get('port','?')})\")
+else:
+    print('disabled')
+" 2>/dev/null || echo "unknown")
+  echo -e "  ${CYAN}◆${NC} Android    $android_enabled"
+
+  echo ""
+
+  # Health checks
+  local health
+  health=$(curl -s -m 3 -H "Authorization: Bearer zc_local_dev_2026" "http://localhost:$PORT/health" 2>/dev/null) || health=""
+  if echo "$health" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['status']=='ok'" 2>/dev/null; then
+    local uptime tools_count
+    uptime=$(echo "$health" | python3 -c "import sys,json; d=json.load(sys.stdin); s=d['runtime']['uptime_seconds']; print(f'{s//3600}h {(s%3600)//60}m {s%60}s')" 2>/dev/null || echo "?")
+    echo -e "  ${GREEN}✓${NC} Local      http://localhost:$PORT  (up $uptime)"
+  else
+    echo -e "  ${RED}✗${NC} Local      http://localhost:$PORT  unreachable"
+  fi
+
+  local remote
+  remote=$(curl -s -m 5 "https://gateway.ay8.app/health" 2>/dev/null) || remote=""
+  if echo "$remote" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['status']=='ok'" 2>/dev/null; then
+    echo -e "  ${GREEN}✓${NC} Remote     https://gateway.ay8.app"
+  else
+    echo -e "  ${RED}✗${NC} Remote     https://gateway.ay8.app  unreachable"
+  fi
+
+  # Tool count
+  local info
+  info=$(curl -s -m 3 -H "Authorization: Bearer zc_local_dev_2026" "http://localhost:$PORT/info" 2>/dev/null) || info=""
+  if [[ -n "$info" ]]; then
+    local tc
+    tc=$(echo "$info" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('tools',[])))" 2>/dev/null || echo "?")
+    echo -e "  ${CYAN}◆${NC} Tools      $tc registered"
+  fi
+
+  echo ""
+}
+
+cmd_logs() {
+  local target="${1:-all}"
+  case "$target" in
+    gateway|gw) tail -f "$GW_LOG" ;;
+    tunnel|tn)  tail -f "$TN_LOG" ;;
+    all|*)
+      echo -e "${BOLD}${CYAN}=== Gateway ===${NC}"
+      tail -20 "$GW_LOG" 2>/dev/null || echo "(no logs)"
+      echo ""
+      echo -e "${BOLD}${CYAN}=== Tunnel ===${NC}"
+      tail -20 "$TN_LOG" 2>/dev/null || echo "(no logs)"
+      ;;
+  esac
+}
+
+cmd_build() {
+  echo -e "${BOLD}${CYAN}Building ZeroClaw (release + android)...${NC}"
+  echo ""
+  cd "$ZCL_DIR"
+  cargo build --release --features android
+  echo ""
+  echo -e "  ${GREEN}✓${NC} Build complete"
+  echo ""
+}
+
+cmd_help() {
+  echo -e "${BOLD}${CYAN}zcl${NC} — ZeroClaw Gateway Control"
+  echo ""
+  echo "  ${BOLD}zcl start${NC}       Start gateway + tunnel"
+  echo "  ${BOLD}zcl stop${NC}        Stop everything"
+  echo "  ${BOLD}zcl restart${NC}     Stop then start"
+  echo "  ${BOLD}zcl status${NC}      Show service status + health"
+  echo "  ${BOLD}zcl logs${NC}        Show recent logs (gateway + tunnel)"
+  echo "  ${BOLD}zcl logs gw${NC}     Tail gateway logs"
+  echo "  ${BOLD}zcl logs tn${NC}     Tail tunnel logs"
+  echo "  ${BOLD}zcl build${NC}       Rebuild release binary with android"
+  echo ""
+}
+
+# ── Dispatch ─────────────────────────────────────────────────
+
+case "${1:-help}" in
+  start)   cmd_start ;;
+  stop)    cmd_stop ;;
+  restart) cmd_restart ;;
+  status)  cmd_status ;;
+  logs)    cmd_logs "${2:-all}" ;;
+  build)   cmd_build ;;
+  help|-h|--help) cmd_help ;;
+  *)
+    echo -e "${RED}Unknown command: $1${NC}"
+    cmd_help
+    exit 1
+    ;;
+esac

@@ -1,0 +1,46 @@
+# Creator Outreach Workflow
+# Merge these sections into ~/.zeroclaw/config.toml
+
+default_provider = "anthropic"
+default_model = "claude-sonnet-4-5-20250929"
+
+[agent]
+max_tool_iterations = 15
+max_history_messages = 50
+
+[identity]
+format = "openclaw"
+
+[memory]
+backend = "sqlite"
+auto_save = true
+
+[cron]
+enabled = true
+
+[browser]
+enabled = true
+allowed_domains = [
+    "tiktok.com",
+    "instagram.com",
+    "twitter.com",
+    "x.com",
+    "youtube.com",
+    "socialblade.com",
+    "tokcount.com",
+]
+
+[http_request]
+enabled = true
+allowed_domains = ["*"]
+timeout_secs = 30
+
+[autonomy]
+level = "full"
+workspace_only = true
+max_actions_per_hour = 50
+
+[cost]
+enabled = true
+daily_limit_usd = 10.0
+monthly_limit_usd = 150.0

@@ -1,3 +1,5 @@
+#[cfg(feature = "android")]
+pub mod android_control;
 pub mod browser;
 pub mod browser_open;
 pub mod composio;
@@ -26,6 +28,8 @@ pub mod screenshot;
 pub mod shell;
 pub mod traits;
 
+#[cfg(feature = "android")]
+pub use android_control::AndroidControlTool;
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
 pub use composio::ComposioTool;
@@ -184,6 +188,14 @@ pub fn all_tools_with_runtime(
             http_config.allowed_domains.clone(),
             http_config.max_response_size,
             http_config.timeout_secs,
+        )));
+    }
+
+    #[cfg(feature = "android")]
+    if root_config.android.enabled {
+        tools.push(Box::new(AndroidControlTool::new(
+            security.clone(),
+            root_config.android.clone(),
         )));
     }
 
