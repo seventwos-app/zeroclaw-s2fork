@@ -1476,6 +1476,7 @@ mod tests {
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
             conversation_id: None,
+            images: vec![],
         }));
         let first = handle_webhook(State(state.clone()), headers.clone(), body)
             .await
@@ -1485,6 +1486,7 @@ mod tests {
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
             conversation_id: None,
+            images: vec![],
         }));
         let second = handle_webhook(State(state), headers, body)
             .await
@@ -1514,6 +1516,7 @@ mod tests {
         let body1 = Ok(Json(WebhookBody {
             message: "hello one".into(),
             conversation_id: None,
+            images: vec![],
         }));
         let first = handle_webhook(State(state.clone()), headers.clone(), body1)
             .await
@@ -1523,6 +1526,7 @@ mod tests {
         let body2 = Ok(Json(WebhookBody {
             message: "hello two".into(),
             conversation_id: None,
+            images: vec![],
         }));
         let second = handle_webhook(State(state), headers, body2)
             .await
@@ -1563,6 +1567,7 @@ mod tests {
             Ok(Json(WebhookBody {
                 message: "hello".into(),
                 conversation_id: None,
+                images: vec![],
             })),
         )
         .await
@@ -1590,6 +1595,7 @@ mod tests {
             Ok(Json(WebhookBody {
                 message: "hello".into(),
                 conversation_id: None,
+                images: vec![],
             })),
         )
         .await
@@ -1617,6 +1623,7 @@ mod tests {
             Ok(Json(WebhookBody {
                 message: "hello".into(),
                 conversation_id: None,
+                images: vec![],
             })),
         )
         .await

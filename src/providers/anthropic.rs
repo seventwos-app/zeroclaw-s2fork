@@ -11,6 +11,10 @@ pub struct AnthropicProvider {
     credential: Option<String>,
     base_url: String,
     client: Client,
+    /// Optional proxy URL for session-key auth (e.g. Cloudflare Worker).
+    /// When set, session-key requests route through this proxy instead of
+    /// hitting claude.ai directly (which gets Cloudflare-challenged).
+    proxy_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -125,6 +129,10 @@ impl AnthropicProvider {
             .map(|u| u.trim_end_matches('/'))
             .unwrap_or("https://api.anthropic.com")
             .to_string();
+        let proxy_url = std::env::var("ZEROCLAW_PROXY_URL")
+            .ok()
+            .map(|u| u.trim_end_matches('/').to_string())
+            .filter(|u| !u.is_empty());
         Self {
             credential: credential
                 .map(str::trim)
@@ -136,10 +144,16 @@ impl AnthropicProvider {
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
+            proxy_url,
         }
     }
 
-    fn is_setup_token(token: &str) -> bool {
+    /// Detect if credential is a claude.ai session key.
+    fn is_session_key(token: &str) -> bool {
+        token.starts_with("sk-ant-sid01-") || token.starts_with("sk-ant-sid02-")
+    }
+
+    fn is_oauth_token(token: &str) -> bool {
         token.starts_with("sk-ant-oat01-")
     }
 
@@ -148,13 +162,74 @@ impl AnthropicProvider {
         request: reqwest::RequestBuilder,
         credential: &str,
     ) -> reqwest::RequestBuilder {
-        if Self::is_setup_token(credential) {
+        if Self::is_oauth_token(credential) {
+            // OAuth tokens require Bearer auth + beta header on api.anthropic.com.
             request
                 .header("Authorization", format!("Bearer {credential}"))
                 .header("anthropic-beta", "oauth-2025-04-20")
         } else {
+            // Standard API keys use x-api-key.
             request.header("x-api-key", credential)
         }
+    }
+
+    /// Send a message via the Worker proxy (for session-key auth).
+    /// The Worker handles claude.ai routing from Cloudflare's edge,
+    /// bypassing the Cloudflare challenge that blocks direct reqwest calls.
+    async fn chat_via_proxy(
+        &self,
+        proxy_url: &str,
+        messages: &[ChatMessage],
+        model: &str,
+    ) -> anyhow::Result<String> {
+        // Build prompt from messages: combine system + user messages.
+        let mut system_parts = Vec::new();
+        let mut user_parts = Vec::new();
+        for msg in messages {
+            match msg.role.as_str() {
+                "system" => system_parts.push(msg.content.as_str()),
+                "assistant" => {
+                    user_parts.push("[Assistant previously said:]");
+                    user_parts.push(msg.content.as_str());
+                }
+                _ => user_parts.push(msg.content.as_str()),
+            }
+        }
+
+        let system = if system_parts.is_empty() {
+            None
+        } else {
+            Some(system_parts.join("\n\n"))
+        };
+        let message = user_parts.join("\n\n");
+
+        let mut body = serde_json::json!({
+            "message": message,
+            "model": model,
+        });
+        if let Some(sys) = system {
+            body["system"] = serde_json::Value::String(sys);
+        }
+
+        let response = self
+            .client
+            .post(format!("{proxy_url}/chat"))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Proxy chat failed ({status}): {text}");
+        }
+
+        let data: serde_json::Value = response.json().await?;
+        data.get("response")
+            .and_then(|r| r.as_str())
+            .map(|s| s.trim().to_string())
+            .ok_or_else(|| anyhow::anyhow!("No response field in proxy reply"))
     }
 
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
@@ -376,9 +451,24 @@ impl Provider for AnthropicProvider {
     ) -> anyhow::Result<String> {
         let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
-                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token)."
+                "Anthropic credentials not set. Set CLAUDE_SESSION_KEY, ANTHROPIC_API_KEY, or ANTHROPIC_OAUTH_TOKEN."
             )
         })?;
+
+        // Route through Worker proxy when using a session key + proxy is configured.
+        if Self::is_session_key(credential) {
+            if let Some(proxy_url) = &self.proxy_url {
+                let mut messages = Vec::new();
+                if let Some(sys) = system_prompt {
+                    messages.push(ChatMessage::system(sys));
+                }
+                messages.push(ChatMessage::user(message));
+                return self.chat_via_proxy(proxy_url, &messages, model).await;
+            }
+            anyhow::bail!(
+                "Session key auth requires ZEROCLAW_PROXY_URL to be set (direct claude.ai access is Cloudflare-blocked)"
+            );
+        }
 
         let request = ChatRequest {
             model: model.to_string(),
@@ -418,9 +508,25 @@ impl Provider for AnthropicProvider {
     ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
-                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token)."
+                "Anthropic credentials not set. Set CLAUDE_SESSION_KEY, ANTHROPIC_API_KEY, or ANTHROPIC_OAUTH_TOKEN."
             )
         })?;
+
+        // Route through Worker proxy when using a session key.
+        if Self::is_session_key(credential) {
+            if let Some(proxy_url) = &self.proxy_url {
+                let text = self
+                    .chat_via_proxy(proxy_url, request.messages, model)
+                    .await?;
+                return Ok(ProviderChatResponse {
+                    text: Some(text),
+                    tool_calls: Vec::new(),
+                });
+            }
+            anyhow::bail!(
+                "Session key auth requires ZEROCLAW_PROXY_URL to be set (direct claude.ai access is Cloudflare-blocked)"
+            );
+        }
 
         let (system_prompt, messages) = Self::convert_messages(request.messages);
         let native_request = NativeChatRequest {
@@ -449,6 +555,12 @@ impl Provider for AnthropicProvider {
     }
 
     fn supports_native_tools(&self) -> bool {
+        // Session key auth uses claude.ai web API which doesn't support native tool calling.
+        if let Some(cred) = &self.credential {
+            if Self::is_session_key(cred) {
+                return false;
+            }
+        }
         true
     }
 
@@ -461,9 +573,23 @@ impl Provider for AnthropicProvider {
     ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
-                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token)."
+                "Anthropic credentials not set. Set CLAUDE_SESSION_KEY, ANTHROPIC_API_KEY, or ANTHROPIC_OAUTH_TOKEN."
             )
         })?;
+
+        // Session key: fall back to text-based chat via proxy.
+        if Self::is_session_key(credential) {
+            if let Some(proxy_url) = &self.proxy_url {
+                let text = self.chat_via_proxy(proxy_url, messages, model).await?;
+                return Ok(ProviderChatResponse {
+                    text: Some(text),
+                    tool_calls: Vec::new(),
+                });
+            }
+            anyhow::bail!(
+                "Session key auth requires ZEROCLAW_PROXY_URL to be set (direct claude.ai access is Cloudflare-blocked)"
+            );
+        }
 
         let (system_prompt, native_messages) = Self::convert_messages(messages);
 
@@ -575,13 +701,43 @@ mod tests {
     }
 
     #[test]
-    fn setup_token_detection_works() {
-        assert!(AnthropicProvider::is_setup_token("sk-ant-oat01-abcdef"));
-        assert!(!AnthropicProvider::is_setup_token("sk-ant-api-key"));
+    fn session_key_detection_works() {
+        assert!(AnthropicProvider::is_session_key(
+            "sk-ant-sid01-abcdef1234567890"
+        ));
+        assert!(AnthropicProvider::is_session_key(
+            "sk-ant-sid02-abcdef1234567890"
+        ));
+        assert!(!AnthropicProvider::is_session_key("sk-ant-oat01-abcdef"));
+        assert!(!AnthropicProvider::is_session_key("sk-ant-api-key"));
     }
 
     #[test]
-    fn apply_auth_uses_bearer_and_beta_for_setup_tokens() {
+    fn oauth_token_detection_works() {
+        assert!(AnthropicProvider::is_oauth_token("sk-ant-oat01-abcdef"));
+        assert!(!AnthropicProvider::is_oauth_token("sk-ant-api-key"));
+    }
+
+    #[test]
+    fn supports_native_tools_false_for_session_key() {
+        let p = AnthropicProvider::new(Some("sk-ant-sid01-test-session-key-value"));
+        assert!(!p.supports_native_tools());
+    }
+
+    #[test]
+    fn supports_native_tools_true_for_api_key() {
+        let p = AnthropicProvider::new(Some("sk-ant-api-key-12345"));
+        assert!(p.supports_native_tools());
+    }
+
+    #[test]
+    fn supports_native_tools_true_for_oauth_token() {
+        let p = AnthropicProvider::new(Some("sk-ant-oat01-oauth-token"));
+        assert!(p.supports_native_tools());
+    }
+
+    #[test]
+    fn apply_auth_uses_bearer_and_beta_for_oauth_tokens() {
         let provider = AnthropicProvider::new(None);
         let request = provider
             .apply_auth(
